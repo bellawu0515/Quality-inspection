@@ -10,12 +10,11 @@ import { fileURLToPath } from 'url';
 const upload = multer({ storage: multer.memoryStorage() });
 
 // -------------------- Field Name Mapping (Chinese) --------------------
-// You can override any field name via environment variables if your column names differ.
 const F_SHIP = {
   SKU: process.env.FIELD_SHIP_SKU || 'SKU',
   PRODUCT: process.env.FIELD_SHIP_PRODUCT || '产品名称',
   PO: process.env.FIELD_SHIP_PO || 'PO号',
-  QTY: process.env.FIELD_SHIP_QTY || '数量',            // 你已用环境变量覆盖为“出货数量”
+  QTY: process.env.FIELD_SHIP_QTY || '数量', // 你 Railway 已覆盖为“出货数量”
   SAMPLE: process.env.FIELD_SHIP_SAMPLE || '抽检数量',
   LINK: process.env.FIELD_SHIP_LINK || '验货链接',
   CONCLUSION: process.env.FIELD_SHIP_CONCLUSION || '验货结论',
@@ -24,9 +23,7 @@ const F_SHIP = {
   M_FAIL: process.env.FIELD_SHIP_M_FAIL || 'M_重大Fail项数',
   SUBMIT_AT: process.env.FIELD_SHIP_SUBMIT_AT || '验货提交时间',
   VERSION: process.env.FIELD_SHIP_VERSION || '版本', // optional
-
-  // ✅ 新增：整单验货照片回写字段（你已建“验货照片”）
-  PHOTOS: process.env.FIELD_SHIP_PHOTOS || '验货照片',
+  PHOTOS: process.env.FIELD_SHIP_PHOTOS || '验货照片', // ✅ 你新增的出货台账附件列
 };
 
 const F_STD = {
@@ -49,9 +46,7 @@ const F_CHK = {
   SEVERITY: process.env.FIELD_CHK_SEVERITY || '严重度',
   RESULT: process.env.FIELD_CHK_RESULT || '结果',
   DEFECT: process.env.FIELD_CHK_DEFECT || '缺陷台数',
-  PHOTOS: process.env.FIELD_CHK_PHOTOS || '照片/视频',
   REMARK: process.env.FIELD_CHK_REMARK || '备注',
-  INSPECTOR: process.env.FIELD_CHK_INSPECTOR || '填写人',
   TIME: process.env.FIELD_CHK_TIME || '填写时间',
 };
 
@@ -69,8 +64,14 @@ function cellToText(v: any): string {
   }
 
   if (typeof v === 'object') {
+    // 常见结构
     if (typeof (v as any).text === 'string') return (v as any).text;
     if (typeof (v as any).name === 'string') return (v as any).name;
+
+    // 数值字段可能是 { number: 123 }
+    if (typeof (v as any).number === 'number') return String((v as any).number);
+
+    // 公式/引用可能是 { value: ... }
     if ((v as any).value != null) return cellToText((v as any).value);
   }
 
@@ -78,13 +79,14 @@ function cellToText(v: any): string {
 }
 
 function asNumber(v: any): number {
-  const s = cellToText(v);
+  if (typeof v === 'number') return v;
+  const s = cellToText(v).trim();
   const n = Number(s);
   return Number.isFinite(n) ? n : 0;
 }
 
 function normalizeSeverity(sev: string): 'C' | 'M' | 'm' | '' {
-  const s = sev || '';
+  const s = (sev || '').trim();
   if (s.includes('致命') || s.includes('🚫') || s.includes('(C)')) return 'C';
   if (s.includes('重大') || s.includes('⚠️') || s.includes('(M)')) return 'M';
   if (s.includes('一般') || s.includes('ℹ️') || s.includes('(m)')) return 'm';
@@ -103,7 +105,7 @@ function makeToken(recordId: string) {
 
 function parseToken(token: string): { rid: string; exp?: number } | null {
   const secret = process.env.INSPECT_TOKEN_SECRET;
-  if (!secret) return { rid: token }; // fallback: token is recordId
+  if (!secret) return { rid: token };
 
   const parts = token.split('.');
   if (parts.length !== 2) return null;
@@ -130,39 +132,38 @@ function getAppUrl(PORT: number): string {
   return process.env.APP_URL || `http://localhost:${PORT}`;
 }
 
+function getRecordId(obj: any): string {
+  return String(obj?.recordId || obj?.record_id || '').trim();
+}
+
 // -------------------- Server --------------------
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT || 3000);
-
   app.use(express.json());
 
-  // 1) Generate Checklist (copy standards -> checklist snapshot) and return inspect URL
+  // 1) Generate Checklist
   app.post('/api/generate-checklist', async (req, res) => {
     try {
       let recordId = req.body?.shipmentRecordId;
       if (req.body?.data?.record_id) recordId = req.body.data.record_id;
       if (!recordId) return res.status(400).json({ error: 'Missing shipmentRecordId' });
-
-      if (!isFeishuConfigured()) {
-        return res.status(500).json({ error: 'Server not configured: missing FEISHU_* or TABLE_ID_* env vars' });
-      }
+      if (!isFeishuConfigured()) return res.status(500).json({ error: 'Server not configured' });
 
       const shipment = await FeishuClient.getShipment(recordId);
       const f = shipment.fields || {};
 
       const sku = cellToText(f[F_SHIP.SKU]).trim();
       const productName = cellToText(f[F_SHIP.PRODUCT]).trim();
-      const version = cellToText(f[F_SHIP.VERSION]).trim(); // optional
+      const version = cellToText(f[F_SHIP.VERSION]).trim();
 
       if (!sku) return res.status(400).json({ error: `出货台账缺少字段：${F_SHIP.SKU}` });
 
-      // Pull standards (try sku+version; fallback sku)
       let standards = await FeishuClient.getStandards(sku, version || undefined);
       if (standards.length === 0 && version) standards = await FeishuClient.getStandards(sku, undefined);
       if (standards.length === 0) return res.status(404).json({ error: `标准库未找到 SKU=${sku} 的检查项` });
 
-      const checklistRecords = standards.map((std) => {
+      const checklistRecords = standards.map((std: any) => {
         const sf = std.fields || {};
         return {
           [F_CHK.LINK]: [recordId],
@@ -181,7 +182,7 @@ async function startServer() {
       const token = makeToken(recordId);
       const inspectUrl = `${getAppUrl(PORT)}/inspect?token=${encodeURIComponent(token)}`;
 
-      // ✅ 直接回写出货台账：验货链接 + 验货状态
+      // ✅ 回写出货台账（无需飞书自动化第3步）
       await FeishuClient.updateShipment(recordId, {
         [F_SHIP.LINK]: inspectUrl,
         [F_SHIP.STATUS]: '验货中',
@@ -194,7 +195,7 @@ async function startServer() {
     }
   });
 
-  // 2) Load checklist by token
+  // 2) Load checklist
   app.get('/api/checklist', async (req, res) => {
     const token = req.query.token as string;
     if (!token) return res.status(400).json({ error: 'Missing token' });
@@ -209,21 +210,23 @@ async function startServer() {
 
       const po = cellToText(f[F_SHIP.PO]) || parsed.rid;
       const sku = cellToText(f[F_SHIP.SKU]);
-      const qty = asNumber(f[F_SHIP.QTY]);
-      const sample = asNumber(f[F_SHIP.SAMPLE]);
+
+      // ✅ 数量兜底：避免字段名/类型导致 0
+      const qty = asNumber(f[F_SHIP.QTY] ?? f['出货数量'] ?? f['数量']);
+      const sample = asNumber(f[F_SHIP.SAMPLE] ?? f['抽检数量']);
 
       const checklist = await FeishuClient.getChecklistByShipment(parsed.rid);
 
-      const items = checklist.map((it) => {
+      const items = (checklist || []).map((it: any) => {
         const cf = it.fields || {};
         return {
-          recordId: it.recordId,
+          recordId: getRecordId(it), // ✅ 关键：必须是真实 record_id
           fields: {
             check_item: cellToText(cf[F_CHK.ITEM]),
             method: cellToText(cf[F_CHK.METHOD]),
             standard: cellToText(cf[F_CHK.STANDARD]),
             severity: cellToText(cf[F_CHK.SEVERITY]),
-            result: cellToText(cf[F_CHK.RESULT]) as any,
+            result: cellToText(cf[F_CHK.RESULT]) || 'N.A',
             defect_count: asNumber(cf[F_CHK.DEFECT]),
             remark: cellToText(cf[F_CHK.REMARK]),
           },
@@ -237,8 +240,8 @@ async function startServer() {
     }
   });
 
-  // 3) Upload File (return file_token)
-  app.post('/api/upload', multer({ storage: multer.memoryStorage() }).single('file'), async (req, res) => {
+  // 3) Upload file
+  app.post('/api/upload', upload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     if (!isFeishuConfigured()) return res.status(500).json({ error: 'Server not configured' });
 
@@ -251,7 +254,7 @@ async function startServer() {
     }
   });
 
-  // 4) Submit results -> update checklist records + write back to shipment (incl. shipment photos)
+  // 4) Submit results
   app.post('/api/submit', async (req, res) => {
     const { token, items, shipmentPhotoTokens } = req.body || {};
     if (!token || !Array.isArray(items)) return res.status(400).json({ error: 'Invalid payload' });
@@ -261,23 +264,24 @@ async function startServer() {
     if (!parsed?.rid) return res.status(401).json({ error: 'Invalid token' });
 
     try {
-      // Fail 校验：如果存在 Fail，则整单必须至少上传1张照片
       const hasFail = items.some((it: any) => it?.result === 'Fail');
       const shipTokens: string[] = Array.isArray(shipmentPhotoTokens) ? shipmentPhotoTokens : [];
       if (hasFail && shipTokens.length === 0) {
-        throw new Error('存在 Fail 项时：必须在页面顶部上传至少 1 张验货照片/视频');
+        throw new Error('存在 Fail 项时：必须上传至少 1 张验货照片');
       }
 
-      // 1) Update checklist rows（不再逐项上传照片，统一走整单附件）
+      // ✅ 构造批量更新（同时给 record_id + recordId，避免 id 为空）
       const updates = items.map((item: any) => {
-        if (item.result === 'Fail') {
-          if (!item.defectCount || Number(item.defectCount) <= 0) {
-            throw new Error('Fail 项必须填写缺陷台数（>0）');
-          }
+        const rid = String(item.recordId || item.record_id || '').trim();
+        if (!rid) throw new Error('提交失败：检查项缺少 recordId（请刷新页面后重试）');
+
+        if (item.result === 'Fail' && (!item.defectCount || Number(item.defectCount) <= 0)) {
+          throw new Error('Fail 项必须填写缺陷台数（>0）');
         }
 
         return {
-          recordId: item.recordId,
+          record_id: rid,
+          recordId: rid,
           fields: {
             [F_CHK.RESULT]: item.result,
             [F_CHK.DEFECT]: item.defectCount || 0,
@@ -289,11 +293,10 @@ async function startServer() {
 
       await FeishuClient.updateChecklistItems(updates);
 
-      // 2) Re-fetch checklist and calculate conclusion
+      // 重新拉取计算结论
       const dbItems = await FeishuClient.getChecklistByShipment(parsed.rid);
 
       let cFail = 0, mFail = 0, minorFail = 0;
-
       for (const dbItem of dbItems) {
         const cf = dbItem.fields || {};
         const result = cellToText(cf[F_CHK.RESULT]);
@@ -312,7 +315,6 @@ async function startServer() {
 
       const status = conclusion === 'PASS' ? '已放行' : conclusion === 'HOLD' ? '待返工' : '已拒收';
 
-      // 3) Write back to shipment table (incl. shipment photos)
       const shipUpdate: any = {
         [F_SHIP.CONCLUSION]: conclusion,
         [F_SHIP.STATUS]: status,
@@ -321,7 +323,6 @@ async function startServer() {
         [F_SHIP.M_FAIL]: mFail,
       };
 
-      // ✅ 写回整单验货照片到出货台账
       if (shipTokens.length > 0) {
         shipUpdate[F_SHIP.PHOTOS] = shipTokens.map((t: string) => ({ file_token: t }));
       }
@@ -337,10 +338,7 @@ async function startServer() {
 
   // Vite Middleware (dev) / Static dist (prod)
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
+    const vite = await createViteServer({ server: { middlewareMode: true }, appType: 'spa' });
     app.use(vite.middlewares);
   } else {
     const __filename = fileURLToPath(import.meta.url);
