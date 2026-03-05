@@ -10,21 +10,23 @@ import { fileURLToPath } from 'url';
 const upload = multer({ storage: multer.memoryStorage() });
 
 // -------------------- Field Name Mapping (Chinese) --------------------
+// You can override any field name via environment variables if your column names differ.
 const F_SHIP = {
   SKU: process.env.FIELD_SHIP_SKU || 'SKU',
   PRODUCT: process.env.FIELD_SHIP_PRODUCT || '产品名称',
   PO: process.env.FIELD_SHIP_PO || 'PO号',
-  QTY: process.env.FIELD_SHIP_QTY || '数量',
+  QTY: process.env.FIELD_SHIP_QTY || '数量',            // 你已用环境变量覆盖为“出货数量”
   SAMPLE: process.env.FIELD_SHIP_SAMPLE || '抽检数量',
   LINK: process.env.FIELD_SHIP_LINK || '验货链接',
   CONCLUSION: process.env.FIELD_SHIP_CONCLUSION || '验货结论',
   STATUS: process.env.FIELD_SHIP_STATUS || '验货状态',
   C_FAIL: process.env.FIELD_SHIP_C_FAIL || 'C_致命Fail项数',
   M_FAIL: process.env.FIELD_SHIP_M_FAIL || 'M_重大Fail项数',
-  // 如果你不建 m_一般Fail项数，这里可以保留但不要写回
-  m_FAIL: process.env.FIELD_SHIP_m_FAIL || 'm_一般Fail项数',
   SUBMIT_AT: process.env.FIELD_SHIP_SUBMIT_AT || '验货提交时间',
   VERSION: process.env.FIELD_SHIP_VERSION || '版本', // optional
+
+  // ✅ 新增：整单验货照片回写字段（你已建“验货照片”）
+  PHOTOS: process.env.FIELD_SHIP_PHOTOS || '验货照片',
 };
 
 const F_STD = {
@@ -135,24 +137,15 @@ async function startServer() {
 
   app.use(express.json());
 
-  // 1) Generate Checklist
+  // 1) Generate Checklist (copy standards -> checklist snapshot) and return inspect URL
   app.post('/api/generate-checklist', async (req, res) => {
     try {
-      // Accept payload from manual call or Feishu button webhook
       let recordId = req.body?.shipmentRecordId;
       if (req.body?.data?.record_id) recordId = req.body.data.record_id;
       if (!recordId) return res.status(400).json({ error: 'Missing shipmentRecordId' });
 
-      const MOCK_MODE = process.env.MOCK_MODE === 'true';
       if (!isFeishuConfigured()) {
-        if (!MOCK_MODE) {
-          return res.status(500).json({
-            error: 'Server not configured: missing FEISHU_* or TABLE_ID_* env vars',
-          });
-        }
-        const token = 'mock-token-' + Date.now();
-        const inspectUrl = `${getAppUrl(PORT)}/inspect?token=${token}`;
-        return res.json({ success: true, inspectUrl, count: 3 });
+        return res.status(500).json({ error: 'Server not configured: missing FEISHU_* or TABLE_ID_* env vars' });
       }
 
       const shipment = await FeishuClient.getShipment(recordId);
@@ -188,7 +181,7 @@ async function startServer() {
       const token = makeToken(recordId);
       const inspectUrl = `${getAppUrl(PORT)}/inspect?token=${encodeURIComponent(token)}`;
 
-      // ✅ 关键：这里直接回写出货台账（你不需要飞书自动化第3步）
+      // ✅ 直接回写出货台账：验货链接 + 验货状态
       await FeishuClient.updateShipment(recordId, {
         [F_SHIP.LINK]: inspectUrl,
         [F_SHIP.STATUS]: '验货中',
@@ -205,7 +198,6 @@ async function startServer() {
   app.get('/api/checklist', async (req, res) => {
     const token = req.query.token as string;
     if (!token) return res.status(400).json({ error: 'Missing token' });
-
     if (!isFeishuConfigured()) return res.status(500).json({ error: 'Server not configured' });
 
     const parsed = parseToken(token);
@@ -245,8 +237,8 @@ async function startServer() {
     }
   });
 
-  // 3) Upload File
-  app.post('/api/upload', upload.single('file'), async (req, res) => {
+  // 3) Upload File (return file_token)
+  app.post('/api/upload', multer({ storage: multer.memoryStorage() }).single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file provided' });
     if (!isFeishuConfigured()) return res.status(500).json({ error: 'Server not configured' });
 
@@ -259,9 +251,9 @@ async function startServer() {
     }
   });
 
-  // 4) Submit results
+  // 4) Submit results -> update checklist records + write back to shipment (incl. shipment photos)
   app.post('/api/submit', async (req, res) => {
-    const { token, items } = req.body || {};
+    const { token, items, shipmentPhotoTokens } = req.body || {};
     if (!token || !Array.isArray(items)) return res.status(400).json({ error: 'Invalid payload' });
     if (!isFeishuConfigured()) return res.status(500).json({ error: 'Server not configured' });
 
@@ -269,9 +261,20 @@ async function startServer() {
     if (!parsed?.rid) return res.status(401).json({ error: 'Invalid token' });
 
     try {
+      // Fail 校验：如果存在 Fail，则整单必须至少上传1张照片
+      const hasFail = items.some((it: any) => it?.result === 'Fail');
+      const shipTokens: string[] = Array.isArray(shipmentPhotoTokens) ? shipmentPhotoTokens : [];
+      if (hasFail && shipTokens.length === 0) {
+        throw new Error('存在 Fail 项时：必须在页面顶部上传至少 1 张验货照片/视频');
+      }
+
+      // 1) Update checklist rows（不再逐项上传照片，统一走整单附件）
       const updates = items.map((item: any) => {
-        const photoTokens: string[] = Array.isArray(item.photoTokens) ? item.photoTokens : [];
-        if (item.result === 'Fail' && photoTokens.length === 0) throw new Error('Fail 必须上传照片/视频');
+        if (item.result === 'Fail') {
+          if (!item.defectCount || Number(item.defectCount) <= 0) {
+            throw new Error('Fail 项必须填写缺陷台数（>0）');
+          }
+        }
 
         return {
           recordId: item.recordId,
@@ -279,7 +282,6 @@ async function startServer() {
             [F_CHK.RESULT]: item.result,
             [F_CHK.DEFECT]: item.defectCount || 0,
             [F_CHK.REMARK]: item.remark || '',
-            [F_CHK.PHOTOS]: photoTokens.map((t: string) => ({ file_token: t })),
             [F_CHK.TIME]: Date.now(),
           },
         };
@@ -287,9 +289,11 @@ async function startServer() {
 
       await FeishuClient.updateChecklistItems(updates);
 
+      // 2) Re-fetch checklist and calculate conclusion
       const dbItems = await FeishuClient.getChecklistByShipment(parsed.rid);
 
       let cFail = 0, mFail = 0, minorFail = 0;
+
       for (const dbItem of dbItems) {
         const cf = dbItem.fields || {};
         const result = cellToText(cf[F_CHK.RESULT]);
@@ -308,15 +312,21 @@ async function startServer() {
 
       const status = conclusion === 'PASS' ? '已放行' : conclusion === 'HOLD' ? '待返工' : '已拒收';
 
-      await FeishuClient.updateShipment(parsed.rid, {
+      // 3) Write back to shipment table (incl. shipment photos)
+      const shipUpdate: any = {
         [F_SHIP.CONCLUSION]: conclusion,
         [F_SHIP.STATUS]: status,
         [F_SHIP.SUBMIT_AT]: Date.now(),
         [F_SHIP.C_FAIL]: cFail,
         [F_SHIP.M_FAIL]: mFail,
-        // 你不建 m_一般Fail项数，就别写回它，避免字段不存在报错
-        // [F_SHIP.m_FAIL]: minorFail,
-      });
+      };
+
+      // ✅ 写回整单验货照片到出货台账
+      if (shipTokens.length > 0) {
+        shipUpdate[F_SHIP.PHOTOS] = shipTokens.map((t: string) => ({ file_token: t }));
+      }
+
+      await FeishuClient.updateShipment(parsed.rid, shipUpdate);
 
       res.json({ success: true, conclusion });
     } catch (err: any) {
